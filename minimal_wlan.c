@@ -47,7 +47,7 @@
 MODULE_AUTHOR("Beginner WiFi Study");
 MODULE_DESCRIPTION("Minimal virtual mac80211 WiFi driver (educational)");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("1.0");
+MODULE_VERSION("1.1");
 
 /* -------------------------------------------------------------------------
  * 1. DRIVER PRIVATE DATA
@@ -67,17 +67,14 @@ struct minimal_wlan_priv {
  *
  * We must tell mac80211 which frequencies we support.
  * A real driver reads this from EEPROM or firmware.
- * We declare just one 2.4 GHz channel (channel 1 = 2412 MHz).
+ * We declare the three standard non-overlapping 2.4 GHz channels:
+ *   ch1 = 2412 MHz, ch6 = 2437 MHz, ch11 = 2462 MHz
  * ---------------------------------------------------------------------- */
 
-/* Single 2.4 GHz channel */
 static struct ieee80211_channel minimal_2ghz_channels[] = {
-	{
-		.band           = NL80211_BAND_2GHZ,
-		.center_freq    = 2412,   /* Channel 1 */
-		.hw_value       = 1,
-		.max_power      = 20,     /* dBm */
-	},
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2412, .hw_value =  1, .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2437, .hw_value =  6, .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2462, .hw_value = 11, .max_power = 20 },
 };
 
 /* Supported rates on 2.4 GHz (802.11b/g style) */
@@ -102,7 +99,212 @@ static struct ieee80211_supported_band minimal_band_2ghz = {
 };
 
 /* -------------------------------------------------------------------------
- * 3. DRIVER CALLBACKS (ieee80211_ops)
+ * 3. FAKE AP TABLE
+ *
+ * Each entry describes one simulated access point.
+ * When the STA sends a Probe Request, we inject a Probe Response for
+ * every entry in this table — just like multiple real APs responding.
+ *
+ * Fields:
+ *   bssid      — fake MAC address for the AP (locally administered: 02:xx)
+ *   ssid       — network name
+ *   ssid_len   — length of ssid (no NUL)
+ *   channel    — 802.11 channel number
+ *   freq       — centre frequency in MHz (must match channel)
+ *   signal     — simulated RSSI in dBm (higher = stronger)
+ *   capability — 802.11 Capability Information field
+ *                  bit 0 = ESS (infrastructure BSS)
+ *                  bit 5 = short preamble
+ *                  bit 10 = short slot time
+ * ---------------------------------------------------------------------- */
+struct fake_ap_info {
+	u8   bssid[ETH_ALEN];
+	char ssid[IEEE80211_MAX_SSID_LEN + 1];
+	u8   ssid_len;
+	u8   channel;
+	u32  freq;     /* MHz */
+	s8   signal;   /* dBm */
+	u16  capability;
+};
+
+static const struct fake_ap_info fake_ap_table[] = {
+	{
+		/* Strong signal, ch1 */
+		.bssid      = { 0x02, 0x00, 0x00, 0xAA, 0xBB, 0x01 },
+		.ssid       = "MinimalNet-A",
+		.ssid_len   = 12,
+		.channel    = 1,
+		.freq       = 2412,
+		.signal     = -45,
+		.capability = 0x0431,   /* ESS | short preamble | short slot */
+	},
+	{
+		/* Medium signal, ch6 */
+		.bssid      = { 0x02, 0x00, 0x00, 0xAA, 0xBB, 0x02 },
+		.ssid       = "MinimalNet-B",
+		.ssid_len   = 12,
+		.channel    = 6,
+		.freq       = 2437,
+		.signal     = -65,
+		.capability = 0x0431,
+	},
+	{
+		/* Weak signal, ch11 */
+		.bssid      = { 0x02, 0x00, 0x00, 0xAA, 0xBB, 0x03 },
+		.ssid       = "MinimalNet-C",
+		.ssid_len   = 12,
+		.channel    = 11,
+		.freq       = 2462,
+		.signal     = -80,
+		.capability = 0x0411,   /* ESS | short preamble */
+	},
+	{
+		/* Hidden SSID simulation — empty SSID in Probe Response */
+		.bssid      = { 0x02, 0x00, 0x00, 0xAA, 0xBB, 0x04 },
+		.ssid       = "",
+		.ssid_len   = 0,
+		.channel    = 6,
+		.freq       = 2437,
+		.signal     = -70,
+		.capability = 0x0411,
+	},
+};
+
+/* -------------------------------------------------------------------------
+ * 4. PROBE RESPONSE INJECTION
+ *
+ * Called from minimal_tx() when we see an outgoing Probe Request.
+ * For each fake AP in fake_ap_table we craft a valid 802.11 Probe Response
+ * frame and hand it to mac80211 via ieee80211_rx(), simulating what a real
+ * AP would transmit over the air.
+ *
+ * Frame layout:
+ *   [ 802.11 MAC header (24 B) ]
+ *   [ Timestamp (8 B) | Beacon Interval (2 B) | Capability (2 B) ]
+ *   [ IE: SSID (variable) ]
+ *   [ IE: Supported Rates (8 B) ]
+ *   [ IE: DS Parameter Set / channel (1 B) ]
+ * ---------------------------------------------------------------------- */
+
+/*
+ * build_and_inject_probe_resp() — craft one Probe Response and inject it.
+ *
+ * @hw:     our ieee80211_hw
+ * @req:    the Probe Request header (we copy the source address as dest)
+ * @ap:     which fake AP is "responding"
+ */
+static void build_and_inject_probe_resp(struct ieee80211_hw *hw,
+					struct ieee80211_hdr *req,
+					const struct fake_ap_info *ap)
+{
+	/*
+	 * IE sizes:
+	 *   SSID IE          = 2 + ssid_len
+	 *   Supported Rates  = 2 + 8
+	 *   DS Parameter Set = 2 + 1
+	 */
+	const int ie_len = (2 + ap->ssid_len) + (2 + 8) + (2 + 1);
+	const int hdr_len = offsetof(struct ieee80211_mgmt,
+				     u.probe_resp.variable);
+
+	struct ieee80211_rx_status rx_status = {};
+	struct ieee80211_mgmt *mgmt;
+	struct sk_buff *skb;
+	u8 *pos;
+
+	skb = dev_alloc_skb(hdr_len + ie_len);
+	if (!skb)
+		return;
+
+	skb_put(skb, hdr_len + ie_len);
+	mgmt = (struct ieee80211_mgmt *)skb->data;
+	memset(mgmt, 0, hdr_len + ie_len);
+
+	/* ── 802.11 MAC header ────────────────────────────────────────── */
+	mgmt->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT |
+					  IEEE80211_STYPE_PROBE_RESP);
+	/* DA = whoever sent the Probe Request */
+	memcpy(mgmt->da,    req->addr2,   ETH_ALEN);
+	/* SA = BSSID = our fake AP */
+	memcpy(mgmt->sa,    ap->bssid,    ETH_ALEN);
+	memcpy(mgmt->bssid, ap->bssid,    ETH_ALEN);
+	mgmt->seq_ctrl = 0;
+
+	/* ── Fixed parameters ─────────────────────────────────────────── */
+	mgmt->u.probe_resp.timestamp  = cpu_to_le64(0);
+	mgmt->u.probe_resp.beacon_int = cpu_to_le16(100);   /* 100 TU */
+	mgmt->u.probe_resp.capab_info = cpu_to_le16(ap->capability);
+
+	/* ── Information Elements ─────────────────────────────────────── */
+	pos = mgmt->u.probe_resp.variable;
+
+	/* SSID IE (tag 0) — empty for hidden networks */
+	*pos++ = WLAN_EID_SSID;
+	*pos++ = ap->ssid_len;
+	if (ap->ssid_len)
+		memcpy(pos, ap->ssid, ap->ssid_len);
+	pos += ap->ssid_len;
+
+	/* Supported Rates IE (tag 1) — 802.11b/g rates */
+	*pos++ = WLAN_EID_SUPP_RATES;
+	*pos++ = 8;
+	*pos++ = 0x82;   /*  1 Mbps, basic */
+	*pos++ = 0x84;   /*  2 Mbps, basic */
+	*pos++ = 0x8B;   /*  5.5 Mbps, basic */
+	*pos++ = 0x96;   /* 11 Mbps, basic */
+	*pos++ = 0x24;   /* 18 Mbps */
+	*pos++ = 0x30;   /* 24 Mbps */
+	*pos++ = 0x48;   /* 36 Mbps */
+	*pos++ = 0x6C;   /* 54 Mbps */
+
+	/* DS Parameter Set IE (tag 3) — tells STA which channel we are on */
+	*pos++ = WLAN_EID_DS_PARAMS;
+	*pos++ = 1;
+	*pos++ = ap->channel;
+
+	/* ── RX status ────────────────────────────────────────────────── */
+	/*
+	 * ieee80211_rx_status is stored in the skb's control buffer (cb[]).
+	 * mac80211 reads it to know on which channel/band the frame arrived
+	 * and what the signal strength was.
+	 */
+	rx_status.band     = NL80211_BAND_2GHZ;
+	rx_status.freq     = ap->freq;
+	rx_status.signal   = ap->signal;
+	rx_status.encoding = RX_ENC_LEGACY;
+	rx_status.rate_idx = 0;   /* 1 Mbps */
+
+	memcpy(IEEE80211_SKB_RXCB(skb), &rx_status, sizeof(rx_status));
+
+	pr_info("minimal_wlan: injecting Probe Response: SSID='%s' BSSID=%pM ch%d signal=%d dBm\n",
+		ap->ssid_len ? ap->ssid : "(hidden)",
+		ap->bssid, ap->channel, ap->signal);
+
+	/*
+	 * Hand the frame to mac80211 as if the hardware just received it.
+	 * ieee80211_rx() takes ownership of the skb — do NOT touch it after.
+	 */
+	ieee80211_rx(hw, skb);
+}
+
+/*
+ * send_fake_probe_responses() — iterate all fake APs and inject one
+ * Probe Response per AP.
+ */
+static void send_fake_probe_responses(struct ieee80211_hw *hw,
+				      struct ieee80211_hdr *req)
+{
+	int i;
+
+	pr_info("minimal_wlan: Probe Request detected — responding with %zu fake AP(s)\n",
+		ARRAY_SIZE(fake_ap_table));
+
+	for (i = 0; i < ARRAY_SIZE(fake_ap_table); i++)
+		build_and_inject_probe_resp(hw, req, &fake_ap_table[i]);
+}
+
+/* -------------------------------------------------------------------------
+ * 5. DRIVER CALLBACKS (ieee80211_ops)
  *
  * mac80211 calls these functions to control our "hardware".
  * Think of them as the hardware abstraction layer.
@@ -118,23 +320,30 @@ static struct ieee80211_supported_band minimal_band_2ghz = {
  *   4. Return — the hardware sends it asynchronously
  *   5. Handle TX-done interrupt → call ieee80211_tx_status()
  *
- * Here we just log the frame type and free it.
+ * Here we log the frame type, intercept Probe Requests, and free it.
  */
 static void minimal_tx(struct ieee80211_hw *hw,
-			struct ieee80211_tx_control *control,
-			struct sk_buff *skb)
+		       struct ieee80211_tx_control *control,
+		       struct sk_buff *skb)
 {
 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 	struct ieee80211_hdr    *hdr  = (struct ieee80211_hdr *)skb->data;
 	__le16 fc = hdr->frame_control;
 
-	/* Print what kind of 802.11 frame this is */
-	if (ieee80211_is_data(fc))
+	if (ieee80211_is_data(fc)) {
 		pr_info("minimal_wlan: TX data frame (%d bytes)\n", skb->len);
-	else if (ieee80211_is_mgmt(fc))
+	} else if (ieee80211_is_mgmt(fc)) {
 		pr_info("minimal_wlan: TX mgmt frame (%d bytes)\n", skb->len);
-	else
+
+		/*
+		 * Intercept outgoing Probe Requests.
+		 * Simulate what real APs on the air would reply.
+		 */
+		if (ieee80211_is_probe_req(fc))
+			send_fake_probe_responses(hw, hdr);
+	} else {
 		pr_info("minimal_wlan: TX ctrl frame (%d bytes)\n", skb->len);
+	}
 
 	/*
 	 * We must tell mac80211 the TX completed (successfully or not).
@@ -183,7 +392,7 @@ static void minimal_stop(struct ieee80211_hw *hw)
  * In a real driver: program the MAC address into hardware registers.
  */
 static int minimal_add_interface(struct ieee80211_hw *hw,
-				  struct ieee80211_vif *vif)
+				 struct ieee80211_vif *vif)
 {
 	pr_info("minimal_wlan: add_interface() type=%d addr=%pM\n",
 		vif->type, vif->addr);
@@ -194,7 +403,7 @@ static int minimal_add_interface(struct ieee80211_hw *hw,
  * remove_interface() — called when a virtual interface is destroyed.
  */
 static void minimal_remove_interface(struct ieee80211_hw *hw,
-				      struct ieee80211_vif *vif)
+				     struct ieee80211_vif *vif)
 {
 	pr_info("minimal_wlan: remove_interface() addr=%pM\n", vif->addr);
 }
@@ -226,9 +435,9 @@ static int minimal_config(struct ieee80211_hw *hw, u32 changed)
  * In a real driver: program RX filter registers in hardware.
  */
 static void minimal_configure_filter(struct ieee80211_hw *hw,
-				      unsigned int changed_flags,
-				      unsigned int *total_flags,
-				      u64 multicast)
+				     unsigned int changed_flags,
+				     unsigned int *total_flags,
+				     u64 multicast)
 {
 	pr_info("minimal_wlan: configure_filter() flags=0x%x\n", *total_flags);
 
@@ -255,7 +464,7 @@ static const struct ieee80211_ops minimal_ops = {
 };
 
 /* -------------------------------------------------------------------------
- * 4. MODULE INIT / EXIT
+ * 6. MODULE INIT / EXIT
  *
  * init  = insmod  → allocate hw, fill capabilities, register with mac80211
  * exit  = rmmod   → unregister, free
@@ -319,7 +528,7 @@ static int __init minimal_wlan_init(void)
 	 * Step C: Register supported frequency bands
 	 *
 	 * wiphy is the "wireless physical device" descriptor inside hw.
-	 * We tell it we support 2.4 GHz only.
+	 * We tell it we support 2.4 GHz only (ch1, ch6, ch11).
 	 * ---------------------------------------------------------------- */
 	g_hw->wiphy->bands[NL80211_BAND_2GHZ] = &minimal_band_2ghz;
 
@@ -348,6 +557,8 @@ static int __init minimal_wlan_init(void)
 	}
 
 	pr_info("minimal_wlan: registered — interface is now visible\n");
+	pr_info("minimal_wlan: %zu fake AP(s) ready to respond to scans\n",
+		ARRAY_SIZE(fake_ap_table));
 	pr_info("minimal_wlan: try: iw dev   OR   ip link show\n");
 	return 0;
 }

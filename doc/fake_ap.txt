@@ -1,0 +1,141 @@
+多個假 AP 功能說明
+==================
+
+目的
+----
+當 STA 送出 Probe Request 時，驅動程式會為 fake_ap_table 中的每一個假 AP
+各自注入一個 Probe Response 給 mac80211，模擬多個真實 AP 在無線頻道上回應的
+行為，讓 iw scan 能看到多筆掃描結果。
+
+
+假 AP 資料表（fake_ap_table）
+------------------------------
+定義於 minimal_wlan.c，共 4 筆：
+
+  AP-A   BSSID 02:00:00:aa:bb:01   SSID MinimalNet-A   ch1  (2412 MHz)  -45 dBm
+  AP-B   BSSID 02:00:00:aa:bb:02   SSID MinimalNet-B   ch6  (2437 MHz)  -65 dBm
+  AP-C   BSSID 02:00:00:aa:bb:03   SSID MinimalNet-C   ch11 (2462 MHz)  -80 dBm
+  hidden BSSID 02:00:00:aa:bb:04   SSID (空)           ch6  (2437 MHz)  -70 dBm
+
+  各欄位說明：
+    bssid      — 假 AP 的 MAC 位址（locally administered，首位元組 0x02）
+    ssid       — 網路名稱；hidden AP 的 ssid_len = 0，IE 內容為空
+    channel    — 802.11 頻道編號（1 / 6 / 11 為 2.4 GHz 三個非重疊頻道）
+    freq       — 中心頻率 MHz，需與 channel 對應
+    signal     — 模擬 RSSI (dBm)，寫入 ieee80211_rx_status.signal
+    capability — 802.11 Capability Information
+                   bit 0  = ESS（infrastructure BSS）
+                   bit 5  = short preamble
+                   bit 10 = short slot time
+
+
+頻道支援擴充
+------------
+原本 minimal_2ghz_channels 只宣告 ch1。
+為了讓 mac80211 接受來自 ch6 / ch11 的 Probe Response，
+現在宣告三個頻道：
+
+  { .center_freq = 2412, .hw_value =  1 }   ← ch1
+  { .center_freq = 2437, .hw_value =  6 }   ← ch6
+  { .center_freq = 2462, .hw_value = 11 }   ← ch11
+
+
+呼叫流程
+--------
+  minimal_tx()
+      │  偵測 ieee80211_is_probe_req(fc)
+      ▼
+  send_fake_probe_responses()
+      │  迴圈跑過 fake_ap_table 每一筆
+      ▼
+  build_and_inject_probe_resp()          ← 每個 AP 各呼叫一次
+      │
+      ├─ dev_alloc_skb()                 ← 分配新的 skb
+      ├─ 填入 802.11 mgmt header
+      │    frame_control = PROBE_RESP
+      │    DA  = Probe Request 的 addr2（發送方）
+      │    SA  = BSSID = fake AP 的 bssid
+      ├─ 填入 fixed parameters
+      │    timestamp / beacon_int / capab_info
+      ├─ 填入 Information Elements
+      │    IE 0: SSID
+      │    IE 1: Supported Rates（8 rates, 802.11b/g）
+      │    IE 3: DS Parameter Set（channel）
+      ├─ 填入 ieee80211_rx_status（band / freq / signal）
+      │    寫入 IEEE80211_SKB_RXCB(skb)
+      └─ ieee80211_rx(hw, skb)           ← 交給 mac80211，skb 所有權轉移
+
+
+Probe Response 訊框結構
+------------------------
+  [ 802.11 MAC header  24 B ]
+    frame_control  (2B) = 0x0050  (Management, Probe Response)
+    duration       (2B)
+    DA             (6B) = STA 的 MAC
+    SA             (6B) = fake AP BSSID
+    BSSID          (6B) = fake AP BSSID
+    seq_ctrl       (2B)
+
+  [ Fixed Parameters  12 B ]
+    Timestamp      (8B) = 0
+    Beacon Interval(2B) = 100 TU
+    Capability     (2B)
+
+  [ Information Elements ]
+    Tag 0: SSID           (2 + ssid_len B)
+    Tag 1: Supported Rates(2 + 8 B)
+    Tag 3: DS Param Set   (2 + 1 B)
+
+
+測試方法
+--------
+自動測試（建議）：
+
+  sudo bash test_fake_ap.sh
+
+  腳本流程：
+    1. make 編譯模組
+    2. insmod 載入
+    3. ip link set <iface> up
+    4. iw dev <iface> scan
+    5. 逐一比對 BSSID / SSID / 頻率 / 訊號強度
+    6. 列印 PASS / FAIL 並顯示 dmesg
+    7. rmmod 卸載
+
+手動測試：
+
+  sudo make reload
+  sudo ip link set wlan_min0 up
+  sudo iw dev wlan_min0 scan
+
+  預期輸出（每個假 AP 一個 BSS 區塊）：
+    BSS 02:00:00:aa:bb:01   freq: 2412   signal: -45.00 dBm   SSID: MinimalNet-A
+    BSS 02:00:00:aa:bb:02   freq: 2437   signal: -65.00 dBm   SSID: MinimalNet-B
+    BSS 02:00:00:aa:bb:03   freq: 2462   signal: -80.00 dBm   SSID: MinimalNet-C
+    BSS 02:00:00:aa:bb:04   freq: 2437   signal: -70.00 dBm   SSID:
+
+  查看 kernel log：
+    dmesg | grep minimal_wlan
+
+  預期 log（scan 過程）：
+    minimal_wlan: TX mgmt frame (N bytes)
+    minimal_wlan: Probe Request detected — responding with 4 fake AP(s)
+    minimal_wlan: injecting Probe Response: SSID='MinimalNet-A' BSSID=02:00:00:aa:bb:01 ch1 signal=-45 dBm
+    minimal_wlan: injecting Probe Response: SSID='MinimalNet-B' BSSID=02:00:00:aa:bb:02 ch6 signal=-65 dBm
+    minimal_wlan: injecting Probe Response: SSID='MinimalNet-C' BSSID=02:00:00:aa:bb:03 ch11 signal=-80 dBm
+    minimal_wlan: injecting Probe Response: SSID='(hidden)'     BSSID=02:00:00:aa:bb:04 ch6  signal=-70 dBm
+
+
+重要注意事項
+------------
+1. skb 所有權：呼叫 ieee80211_rx() 之後 skb 由 mac80211 接管，
+   不可再存取或釋放。
+
+2. ieee80211_rx_status 必須透過 IEEE80211_SKB_RXCB(skb) 寫入 skb->cb，
+   不能只是傳遞一個本地變數給 ieee80211_rx()。
+
+3. fake_ap_table 中的 freq 必須出現在 minimal_2ghz_channels 所宣告的
+   頻率清單中，否則 mac80211 會丟棄該訊框。
+
+4. BSSID 首位元組設為 0x02 表示 locally administered address，
+   確保不與真實 OUI 衝突。

@@ -1,0 +1,281 @@
+改善 RX Status — 說明文件
+==========================
+
+本文件說明 v1.1 對 ieee80211_rx_status 處理所做的改善，
+包含新增欄位的用途、API 說明、以及測試驗證方法。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+一、改善摘要（v1.0 → v1.1）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────┬──────────────┬──────────────────────┐
+│ 項目                        │ v1.0         │ v1.1                 │
+├─────────────────────────────┼──────────────┼──────────────────────┤
+│ RX 路徑                     │ 無           │ minimal_rx_inject()  │
+│ rx_status.freq              │ 硬寫 2412    │ 從 priv->cur_freq 讀 │
+│ rx_status.signal            │ 硬寫 -50     │ 參數化，可按需調整   │
+│ rx_status.chains            │ 未填         │ BIT(0)（單天線）     │
+│ rx_status.chain_signal[]    │ 未填         │ 與 signal 同步填入   │
+│ rx_status.encoding / bw     │ 未填         │ RX_ENC_LEGACY / 20M  │
+│ rx_status.rate_idx          │ 硬寫         │ 參數化，bound-checked│
+│ rx_status.nss               │ 未填         │ 1（單空間流）        │
+│ rx_status.mactime           │ 未填         │ atomic64 TSF 計數器  │
+│ rx_status.boottime_ns       │ 未填         │ ktime_get_boottime_ns│
+│ rx_status.flag              │ 未填         │ RX_FLAG_MACTIME_START│
+│ TSF ops（get/set/reset）    │ 未實作       │ 三個 ops 皆實作      │
+│ priv->cur_freq 追蹤         │ 無           │ config() 更新        │
+│ priv->rx_filter_flags 追蹤  │ 無           │ configure_filter() 存│
+└─────────────────────────────┴──────────────┴──────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+二、ieee80211_rx_status 欄位詳解
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+以下依重要性排序說明每個欄位。
+
+────────────────────────────────────────────────────────────────
+2-1. band 與 freq（必填）
+────────────────────────────────────────────────────────────────
+
+  rx_status->band = NL80211_BAND_2GHZ;
+  rx_status->freq = priv->cur_freq;  /* MHz */
+
+  ‣ band  告知 mac80211 要查哪張 rate table。
+          若填錯（例如用了 5GHz band 但 freq 是 2.4G），
+          mac80211 找不到對應 channel，會 silently drop 該幀。
+
+  ‣ freq  必須與目前 BSS channel 一致。
+          cfg80211 會比對 scan entry，不一致直接丟棄。
+          我們在 config() 中更新 priv->cur_freq，確保一致。
+
+────────────────────────────────────────────────────────────────
+2-2. signal 與 chain_signal（需搭配 SIGNAL_DBM flag）
+────────────────────────────────────────────────────────────────
+
+  rx_status->signal          = -55;   /* dBm，整個 frame 的 RSSI */
+  rx_status->chains          = BIT(0); /* 哪些天線有效 */
+  rx_status->chain_signal[0] = -55;   /* 天線 0 的 RSSI */
+
+  ‣ signal 只有在 hw flags 設了 IEEE80211_HW_SIGNAL_DBM 時才有意義。
+    未設的情況下 mac80211 把它當 arbitrary unit，不換算 dBm。
+
+  ‣ chains 是 bitmask：bit 0 = 天線 A，bit 1 = 天線 B，以此類推。
+    chain_signal[] 必須填入 chains 中每個有效 bit 對應的 RSSI。
+
+  ‣ 典型值範圍：
+      -30 dBm  非常強（實體距離很近）
+      -55 dBm  良好
+      -70 dBm  普通
+      -85 dBm  弱，可能掉包
+      -95 dBm  接近底噪，幾乎無法解調
+
+────────────────────────────────────────────────────────────────
+2-3. encoding, bw, rate_idx, nss（速率資訊）
+────────────────────────────────────────────────────────────────
+
+  rx_status->encoding = RX_ENC_LEGACY;   /* 802.11a/b/g */
+  rx_status->bw       = RATE_INFO_BW_20; /* 20 MHz */
+  rx_status->rate_idx = 4;               /* 6 Mbps OFDM */
+  rx_status->nss      = 1;
+
+  ‣ encoding 決定 rate_idx 的解讀方式：
+      RX_ENC_LEGACY  → 索引進 band->bitrates[]（如 minimal_2ghz_rates）
+      RX_ENC_HT      → MCS index（0–7 = 1 stream 802.11n）
+      RX_ENC_VHT     → MCS index（0–9, nss 另外指定）
+      RX_ENC_HE      → MCS index（0–11, Wi-Fi 6）
+
+  ‣ bw 影響 radiotap header 顯示的頻寬。
+      RATE_INFO_BW_20  → 20 MHz（2.4G 標準）
+      RATE_INFO_BW_40  → 40 MHz（802.11n HT40）
+      RATE_INFO_BW_80  → 80 MHz（802.11ac）
+
+  ‣ nss = Number of Spatial Streams，單天線裝置固定填 1。
+
+  ‣ 錯填 encoding/rate_idx 不會讓核心崩潰，但：
+      • Wireshark radiotap 會顯示錯誤速率
+      • mac80211 rate control 統計會偏差
+
+────────────────────────────────────────────────────────────────
+2-4. mactime（TSF 時間戳）
+────────────────────────────────────────────────────────────────
+
+  rx_status->mactime = atomic64_add_return(1000, &priv->tsf_us);
+  rx_status->flag   |= RX_FLAG_MACTIME_START;
+
+  ‣ mactime 是 64-bit 微秒計數器，來自硬體 TSF 時鐘。
+
+  ‣ mac80211 用它來：
+      • IBSS TSF synchronisation（對齊 ad-hoc 網路的 Beacon）
+      • 計算 TBTT（Target Beacon Transmission Time）
+      • 填入 Beacon/Probe Response 的 Timestamp field（8 bytes）
+
+  ‣ RX_FLAG_MACTIME_START vs RX_FLAG_MACTIME_END：
+      START：mactime 是 preamble 第一個 symbol 的時間（精度最高，推薦）
+      END：  mactime 是最後一個 symbol 的時間（有些硬體比較容易提供）
+      兩者擇一設定，不可同時設。
+
+  ‣ 未填 mactime 且未設 flag 時，mac80211 不使用時間戳，
+    IBSS 和某些 AP 功能會不正常（但對 STA 模式影響較小）。
+
+────────────────────────────────────────────────────────────────
+2-5. boottime_ns（掛鐘時間）
+────────────────────────────────────────────────────────────────
+
+  rx_status->boottime_ns = ktime_get_boottime_ns();
+
+  ‣ cfg80211 用這個時間戳判斷 scan result (BSS) 是否過期。
+    如果不填，BSS entry 永遠不會從 scan list 消失，
+    用 "iw dev wlan_min0 scan" 會看到永久殘留的舊 AP。
+
+  ‣ ktime_get_boottime_ns() 回傳自系統開機以來的奈秒數，
+    在 suspend 期間也繼續計時（與 ktime_get_ns() 不同）。
+
+────────────────────────────────────────────────────────────────
+2-6. flag（RX_FLAG_* bitmask）
+────────────────────────────────────────────────────────────────
+
+  常用 flag 說明：
+
+  RX_FLAG_MACTIME_START  — mactime 為 preamble 起始時間（見上）
+  RX_FLAG_MACTIME_END    — mactime 為幀結束時間
+
+  RX_FLAG_DECRYPTED      — 硬體已解密 payload
+                           mac80211 跳過軟體解密
+  RX_FLAG_MMIC_STRIPPED  — TKIP Michael MIC 已驗證並去除
+                           必須與 RX_FLAG_DECRYPTED 一起設
+
+  RX_FLAG_NO_SIGNAL_VAL  — signal 欄位無效，不要顯示
+                           本驅動「不」設此 flag，因為我們有填 signal
+
+  RX_FLAG_AMPDU_DETAILS  — 此幀是 A-MPDU 聚合的一部分
+  RX_FLAG_AMPDU_LAST_KNOWN — 是否知道這是不是最後一個子幀
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+三、TSF ops（get_tsf / set_tsf / reset_tsf）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+mac80211 透過以下三個 ops 管理硬體 TSF 計時器：
+
+  get_tsf(hw, vif)
+    回傳目前 TSF 值（微秒）。
+    mac80211 在組建 Beacon Timestamp 欄位時呼叫。
+
+  set_tsf(hw, vif, tsf)
+    設定 TSF 值。
+    加入 IBSS 且對方 TSF 更新時，mac80211 呼叫以同步。
+
+  reset_tsf(hw, vif)
+    將 TSF 歸零。
+    建立新 IBSS 或重設 BSS 時呼叫。
+
+  實作：
+    我們用 atomic64_t tsf_us 模擬，不需 spinlock。
+    atomic64 保證在多 CPU 環境（timer + softirq + process context）
+    同時存取時仍然安全。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+四、新增函式說明
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+minimal_rx_status_fill(priv, rx_status, signal_dbm, rate_idx)
+  集中填入所有 ieee80211_rx_status 欄位的 helper。
+  好處：未來若需改幀注入邏輯，只需改一個地方。
+
+minimal_rx_inject(hw, fc)
+  建立最小 802.11 三地址 header，呼叫 rx_status_fill()，
+  最後呼叫 ieee80211_rx_irqsafe() 送進 mac80211。
+  教學用途：在 module init 時注入一個 Action frame 示範 RX 路徑。
+
+  注意：真實驅動程式的 RX 由硬體中斷觸發，不在 init 中呼叫。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+五、測試方法
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+────────────────────────────────────────────────────────────────
+測試 1：確認 rx_inject 在 insmod 時執行
+────────────────────────────────────────────────────────────────
+
+  sudo make load
+  dmesg | grep minimal_wlan
+  # 預期出現（需啟用 dyndbg，見下）：
+  #   minimal_wlan: rx_inject fc=0x00d0 freq=2412 signal=-55 rate_idx=4
+
+  # 啟用 pr_debug 輸出：
+  sudo bash -c 'echo "module minimal_wlan +p" > /sys/kernel/debug/dynamic_debug/control'
+  sudo rmmod minimal_wlan
+  sudo insmod minimal_wlan.ko
+  dmesg | tail -10
+
+────────────────────────────────────────────────────────────────
+測試 2：確認 TSF ops 被 mac80211 呼叫
+────────────────────────────────────────────────────────────────
+
+  # 在 STA 模式掃描會觸發 get_tsf（如有連線目標）
+  sudo ip link set wlan_min0 up
+  sudo iw dev wlan_min0 scan
+  dmesg | grep "set_tsf\|reset_tsf\|get_tsf"
+  # 加入 IBSS 時會看到 reset_tsf() 被呼叫
+
+────────────────────────────────────────────────────────────────
+測試 3：驗證 radiotap header（Wireshark）
+────────────────────────────────────────────────────────────────
+
+  # 建立 monitor 介面抓注入的 RX 幀
+  sudo iw dev wlan_min0 interface add mon0 type monitor
+  sudo ip link set mon0 up
+
+  sudo tcpdump -i mon0 -c 5 -w /tmp/rx_test.pcap
+
+  # 用 tshark 分析 radiotap
+  tshark -r /tmp/rx_test.pcap -T fields \
+      -e radiotap.channel.freq \
+      -e radiotap.dbm_antsignal \
+      -e radiotap.datarate \
+      -e radiotap.timestamp
+  # 預期：
+  #   freq=2412, signal=-55, datarate=6.0, timestamp=非零
+
+  sudo iw dev mon0 del
+
+────────────────────────────────────────────────────────────────
+測試 4：確認 cur_freq 隨 config() 更新
+────────────────────────────────────────────────────────────────
+
+  sudo ip link set wlan_min0 up
+  sudo iw dev wlan_min0 set channel 6
+  dmesg | grep "tuning to"
+  # → "minimal_wlan: config() — tuning to 2437 MHz"
+
+  # 之後 rx_inject 產生的幀 freq 應為 2437
+  # （可透過 tcpdump radiotap 驗證）
+
+────────────────────────────────────────────────────────────────
+測試 5：確認 configure_filter 儲存 flags
+────────────────────────────────────────────────────────────────
+
+  sudo ip link set wlan_min0 up
+  dmesg | grep "configure_filter"
+  # → "minimal_wlan: configure_filter() accepted_flags=0x..."
+  # 數值應為 FIF_ALLMULTI | FIF_BCN_PRBRESP_PROMISC 等的組合
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+六、常見問題
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: tcpdump 看不到 rx_inject 的幀？
+A: 確認 mon0 在 insmod 之後才建立沒關係，
+   但 ip link set mon0 up 必須在 inject 之前完成。
+   因為 init 裡的 inject 只發一次，可在 rmmod/insmod 循環測試。
+
+Q: signal 在 Wireshark 顯示為 0 或不顯示？
+A: 確認 ieee80211_hw_set(g_hw, SIGNAL_DBM) 已在 register_hw 前設定。
+   少了這個 flag，mac80211 忽略 rx_status->signal。
+
+Q: 舊核心（< 5.10）編譯失敗？
+A: ktime_get_boottime_ns() 在 5.3+ 才有，
+   舊核心請改用 ktime_to_ns(ktime_get_boottime())。
+
+Q: atomic64_t 在 32-bit ARM 上有效能問題？
+A: 可改用 spinlock_t + u64 保護，但 atomic64 在大多數架構夠快。
+   教學情境下無需擔心。

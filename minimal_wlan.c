@@ -25,6 +25,18 @@
  *          ▼
  *   [ (fake) hardware ]      ← simulated — frames are just dropped/printed
  *
+ * BEACON INJECTION:
+ *   When the driver is configured as an AP (via "iw" or hostapd), mac80211
+ *   calls bss_info_changed() with BSS_CHANGED_BEACON_ENABLED.
+ *   We then start a kernel timer that fires every BEACON_INTERVAL_MS.
+ *   On each tick:
+ *     1. ieee80211_beacon_get_tim() asks mac80211 to build the Beacon frame
+ *        (it fills in SSID, rates, TIM element, etc.)
+ *     2. We fill a fake ieee80211_rx_status (channel, signal, rate)
+ *     3. ieee80211_rx_irqsafe() injects the frame as if the hardware just
+ *        received it off the air — mac80211 forwards it to any listening
+ *        monitor or scanning station interface.
+ *
  * BUILD:
  *   make
  *   sudo insmod minimal_wlan.ko
@@ -39,7 +51,17 @@
 #include <linux/init.h>         /* __init, __exit                          */
 #include <linux/skbuff.h>       /* sk_buff — the universal packet container */
 #include <linux/ieee80211.h>    /* 802.11 frame definitions                */
+#include <linux/timer.h>        /* timer_list, mod_timer, del_timer_sync   */
 #include <net/mac80211.h>       /* mac80211 API — the main interface        */
+
+/*
+ * BEACON_INTERVAL_MS — how often we inject a Beacon frame.
+ *
+ * The 802.11 standard uses "Time Units" (TU = 1024 µs).
+ * A typical AP uses a beacon interval of 100 TU ≈ 102.4 ms.
+ * We round to 100 ms for simplicity.
+ */
+#define BEACON_INTERVAL_MS  100
 
 /* -------------------------------------------------------------------------
  * Module metadata
@@ -57,9 +79,14 @@ MODULE_VERSION("1.0");
  * pointer to it via hw->priv.
  * ---------------------------------------------------------------------- */
 struct minimal_wlan_priv {
-	struct ieee80211_hw *hw;       /* back-pointer to our hw handle    */
-	bool                 started;  /* true after drv_start() is called */
-	/* In a real driver: DMA rings, firmware state, spinlocks, etc.    */
+	struct ieee80211_hw  *hw;             /* back-pointer to our hw handle      */
+	bool                  started;        /* true after drv_start() is called   */
+
+	/* --- Beacon injection state ----------------------------------------- */
+	struct timer_list     beacon_timer;   /* fires every BEACON_INTERVAL_MS     */
+	struct ieee80211_vif *ap_vif;         /* AP vif currently beaconing, or NULL */
+	bool                  beacon_enabled; /* true while beacon timer is running  */
+	/* In a real driver: DMA rings, firmware state, spinlocks, etc.           */
 };
 
 /* -------------------------------------------------------------------------
@@ -165,12 +192,22 @@ static int minimal_start(struct ieee80211_hw *hw)
  * stop() — called when the last interface goes down.
  *
  * In a real driver: flush TX queues, power off hardware.
+ * We also ensure the beacon timer is cancelled here as a safety net,
+ * in case bss_info_changed() was never called to disable it.
  */
 static void minimal_stop(struct ieee80211_hw *hw)
 {
 	struct minimal_wlan_priv *priv = hw->priv;
 
 	pr_info("minimal_wlan: stop() — hardware powered off (simulated)\n");
+
+	if (priv->beacon_enabled) {
+		priv->beacon_enabled = false;
+		del_timer_sync(&priv->beacon_timer);
+		priv->ap_vif = NULL;
+		pr_info("minimal_wlan: stop() — beacon timer cancelled\n");
+	}
+
 	priv->started = false;
 }
 
@@ -240,22 +277,193 @@ static void minimal_configure_filter(struct ieee80211_hw *hw,
 			 FIF_PROBE_REQ | FIF_OTHER_BSS);
 }
 
+/* -------------------------------------------------------------------------
+ * 4. BEACON INJECTION
+ *
+ * Real AP hardware broadcasts a Beacon frame on the air every beacon
+ * interval.  In our virtual driver we simulate this by:
+ *
+ *   a) Using a kernel timer as the "hardware beacon timer".
+ *   b) Asking mac80211 to build the Beacon skb for us
+ *      (it knows the SSID, rates, TIM element, etc.).
+ *   c) Feeding the frame back via ieee80211_rx_irqsafe() so that
+ *      mac80211 — and any monitor interface — sees it as if it arrived
+ *      off the air.
+ *
+ * Flow diagram:
+ *
+ *   [kernel timer] ──fires──► beacon_timer_fn()
+ *                                  │
+ *                                  ├─► ieee80211_beacon_get_tim()   (build frame)
+ *                                  │         mac80211 fills SSID, TIM, rates…
+ *                                  │
+ *                                  ├─► fill ieee80211_rx_status     (fake radio metadata)
+ *                                  │
+ *                                  └─► ieee80211_rx_irqsafe()       (inject into stack)
+ *                                            mac80211 forwards to monitor / scan
+ * ---------------------------------------------------------------------- */
+
+/*
+ * beacon_timer_fn() — called by the kernel timer every BEACON_INTERVAL_MS.
+ *
+ * CONTEXT: softirq (timer context) — must not sleep, must not call
+ *          anything that may block.  ieee80211_rx_irqsafe() is safe here
+ *          because it uses a per-CPU tasklet internally.
+ */
+static void beacon_timer_fn(struct timer_list *t)
+{
+	struct minimal_wlan_priv *priv = from_timer(priv, t, beacon_timer);
+	struct ieee80211_hw      *hw   = priv->hw;
+	struct ieee80211_vif     *vif  = priv->ap_vif;
+	struct sk_buff           *skb;
+	struct ieee80211_rx_status *rx_status;
+
+	if (!priv->beacon_enabled || !vif)
+		return;
+
+	/*
+	 * Step 1 — Build the Beacon frame.
+	 *
+	 * ieee80211_beacon_get_tim() lets mac80211 construct the full
+	 * 802.11 Beacon management frame.  It fills in:
+	 *   • Fixed fields (timestamp, beacon interval, capability)
+	 *   • SSID IE
+	 *   • Supported Rates IE
+	 *   • TIM (Traffic Indication Map) IE for buffered unicast frames
+	 *   • Any extra IEs registered by hostapd via nl80211
+	 *
+	 * Arguments:
+	 *   hw          — our hw handle
+	 *   vif         — the AP virtual interface
+	 *   tim_offset  — (out) byte offset of TIM IE in the frame; NULL = don't care
+	 *   tim_length  — (out) length of TIM IE; NULL = don't care
+	 *   link_id     — 0 for a non-MLO (legacy) BSS
+	 *
+	 * NOTE: The link_id parameter was added in kernel 5.19 for Multi-Link
+	 * Operation (MLO / WiFi 7). Pass 0 for a classic single-link BSS.
+	 * On older kernels without the link_id argument, drop that parameter.
+	 */
+	skb = ieee80211_beacon_get_tim(hw, vif, NULL, NULL, 0);
+	if (!skb) {
+		/* mac80211 may return NULL if the BSS is not yet fully configured */
+		goto rearm;
+	}
+
+	/*
+	 * Step 2 — Fake the radio receive metadata.
+	 *
+	 * ieee80211_rx_status is stored in the skb's control buffer (cb[]).
+	 * mac80211 reads it to learn: which band/channel, signal strength,
+	 * and encoding/rate of the received frame.
+	 *
+	 * IEEE80211_SKB_RXCB() is the helper that casts skb->cb to the
+	 * ieee80211_rx_status pointer.
+	 */
+	rx_status = IEEE80211_SKB_RXCB(skb);
+	memset(rx_status, 0, sizeof(*rx_status));
+
+	rx_status->band     = NL80211_BAND_2GHZ;
+	rx_status->freq     = 2412;          /* Channel 1 center frequency, MHz  */
+	rx_status->signal   = -50;           /* Fake RSSI in dBm (strong signal) */
+	rx_status->encoding = RX_ENC_LEGACY; /* 802.11b/g rate encoding          */
+	rx_status->rate_idx = 0;             /* index into our rates[] → 1 Mbps  */
+
+	/*
+	 * Step 3 — Inject the frame into the mac80211 receive path.
+	 *
+	 * ieee80211_rx_irqsafe() is the IRQ-safe variant of ieee80211_rx().
+	 * It queues the skb on a per-CPU tasklet so it is safe to call from
+	 * timer context (softirq).
+	 *
+	 * mac80211 will:
+	 *   • Validate the frame
+	 *   • Update the BSS info seen by cfg80211
+	 *   • Forward a copy to any open monitor interface
+	 *   • Deliver it to scanning station interfaces looking for this BSSID
+	 */
+	pr_debug("minimal_wlan: beacon_timer_fn — injecting Beacon (%d bytes)\n",
+		 skb->len);
+	ieee80211_rx_irqsafe(hw, skb);
+	/* skb is now owned by mac80211; do NOT touch it after this point */
+
+rearm:
+	/* Rearm the timer for the next beacon interval */
+	mod_timer(&priv->beacon_timer,
+		  jiffies + msecs_to_jiffies(BEACON_INTERVAL_MS));
+}
+
+/*
+ * minimal_bss_info_changed() — called by mac80211 when BSS parameters change.
+ *
+ * We only care about BSS_CHANGED_BEACON_ENABLED.  When set, the AP is
+ * ready to beacon (SSID configured, channel set).  When cleared, we stop.
+ *
+ * Other common changed flags (not handled here but worth knowing):
+ *   BSS_CHANGED_BSSID        — BSSID changed
+ *   BSS_CHANGED_ASSOC        — association state changed (STA mode)
+ *   BSS_CHANGED_BEACON_INT   — beacon interval changed
+ *   BSS_CHANGED_ERP_SLOT     — slot time changed (b/g protection)
+ */
+static void minimal_bss_info_changed(struct ieee80211_hw *hw,
+				     struct ieee80211_vif *vif,
+				     struct ieee80211_bss_conf *info,
+				     u64 changed)
+{
+	struct minimal_wlan_priv *priv = hw->priv;
+
+	if (!(changed & BSS_CHANGED_BEACON_ENABLED))
+		return;
+
+	if (info->enable_beacon && !priv->beacon_enabled) {
+		/*
+		 * AP just enabled beaconing — start the timer.
+		 *
+		 * We remember the vif pointer so beacon_timer_fn() can call
+		 * ieee80211_beacon_get_tim(hw, vif, …).  The vif is guaranteed
+		 * to be valid until remove_interface() is called, which happens
+		 * only after mac80211 disables beaconing first.
+		 */
+		pr_info("minimal_wlan: bss_info_changed — beacon ENABLED, starting timer\n");
+		priv->ap_vif         = vif;
+		priv->beacon_enabled = true;
+		mod_timer(&priv->beacon_timer,
+			  jiffies + msecs_to_jiffies(BEACON_INTERVAL_MS));
+
+	} else if (!info->enable_beacon && priv->beacon_enabled) {
+		/*
+		 * AP stopped beaconing — cancel the timer.
+		 *
+		 * del_timer_sync() blocks until any currently running callback
+		 * finishes, so it is safe to clear ap_vif afterwards.
+		 */
+		pr_info("minimal_wlan: bss_info_changed — beacon DISABLED, stopping timer\n");
+		priv->beacon_enabled = false;
+		del_timer_sync(&priv->beacon_timer);
+		priv->ap_vif = NULL;
+	}
+}
+
+/* -------------------------------------------------------------------------
+ * 5. DRIVER CALLBACKS (ieee80211_ops) — continued
+ * ---------------------------------------------------------------------- */
+
 /*
  * The ops table — the "vtable" that mac80211 uses to call into our driver.
  * Only the fields we fill in are active; others default to no-op.
  */
 static const struct ieee80211_ops minimal_ops = {
-	.tx               = minimal_tx,
-	.start            = minimal_start,
-	.stop             = minimal_stop,
-	.add_interface    = minimal_add_interface,
-	.remove_interface = minimal_remove_interface,
-	.config           = minimal_config,
-	.configure_filter = minimal_configure_filter,
+	.tx                = minimal_tx,
+	.start             = minimal_start,
+	.stop              = minimal_stop,
+	.add_interface     = minimal_add_interface,
+	.remove_interface  = minimal_remove_interface,
+	.config            = minimal_config,
+	.configure_filter  = minimal_configure_filter,
+	.bss_info_changed  = minimal_bss_info_changed,  /* Beacon inject trigger */
 };
 
 /* -------------------------------------------------------------------------
- * 4. MODULE INIT / EXIT
+ * 6. MODULE INIT / EXIT
  *
  * init  = insmod  → allocate hw, fill capabilities, register with mac80211
  * exit  = rmmod   → unregister, free
@@ -287,6 +495,16 @@ static int __init minimal_wlan_init(void)
 
 	priv = g_hw->priv;
 	priv->hw = g_hw;
+
+	/*
+	 * Initialise the beacon timer using the modern timer_setup() API
+	 * (replaces the old init_timer() + timer.data pattern).
+	 * The timer is not armed here; it starts in bss_info_changed()
+	 * when mac80211 enables beaconing on an AP interface.
+	 */
+	timer_setup(&priv->beacon_timer, beacon_timer_fn, 0);
+	priv->beacon_enabled = false;
+	priv->ap_vif         = NULL;
 
 	/* ------------------------------------------------------------------
 	 * Step B: Set hardware capabilities

@@ -1,0 +1,203 @@
+Beacon 注入功能說明與測試方法
+================================
+
+本文件說明 minimal_wlan 驅動程式中 Beacon 注入功能的設計概念，
+以及如何在系統上實際驗證其運作。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+一、功能摘要
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+真實 AP 硬體每隔一個 Beacon 間隔（標準為 100 TU ≈ 102.4 ms）
+就會廣播一個 Beacon 管理幀，讓周圍的 Station 裝置知道這個 AP 存在。
+
+虛擬驅動程式以「軟體計時器 + 回注」模擬此行為：
+
+  步驟 1  kernel timer 每 100 ms 觸發 beacon_timer_fn()
+           │
+  步驟 2  呼叫 ieee80211_beacon_get_tim()
+           │   mac80211 組建完整的 Beacon frame
+           │   （含 SSID IE、Supported Rates IE、TIM IE 等）
+           │
+  步驟 3  填入假的 ieee80211_rx_status
+           │   band=2.4 GHz, freq=2412 MHz, signal=-50 dBm
+           │
+  步驟 4  呼叫 ieee80211_rx_irqsafe()
+               mac80211 將 frame 送入接收路徑
+               → monitor 介面可抓到此幀
+               → cfg80211 scan 結果中會出現此 BSS
+
+新增的主要程式碼位置（minimal_wlan.c）：
+
+  結構體欄位  minimal_wlan_priv
+    beacon_timer   — struct timer_list，虛擬硬體計時器
+    ap_vif         — 目前正在 Beacon 的 AP vif 指標
+    beacon_enabled — bool，計時器是否正在運行
+
+  函式
+    beacon_timer_fn()         timer callback，執行步驟 2–4
+    minimal_bss_info_changed() ops callback，由 mac80211 在
+                               BSS_CHANGED_BEACON_ENABLED 時呼叫
+    minimal_stop()             關機時安全取消計時器
+
+  初始化
+    timer_setup() 在 module init 中設定計時器，
+    計時器此時尚未 armed，等待 bss_info_changed() 啟動。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+二、核心 API 說明
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ieee80211_beacon_get_tim(hw, vif, tim_offset, tim_length, link_id)
+  由 mac80211 組建 Beacon frame 的 skb。
+  驅動程式不需要手動填 802.11 header，mac80211 全部處理。
+  link_id=0 代表傳統單鏈路 BSS（非 WiFi 7 MLO）。
+  回傳 NULL 表示 BSS 尚未完整設定，跳過此次注入即可。
+
+IEEE80211_SKB_RXCB(skb)
+  取得 skb->cb[] 中的 ieee80211_rx_status 指標。
+  驅動程式必須填入 band、freq、signal 等欄位，
+  mac80211 才能正確分類這個接收到的幀。
+
+ieee80211_rx_irqsafe(hw, skb)
+  IRQ/softirq 安全版的 ieee80211_rx()。
+  將 skb 排入 per-CPU tasklet，不會阻塞。
+  呼叫後 skb 歸 mac80211 所有，驅動程式不得再存取。
+
+from_timer(priv, t, beacon_timer)
+  現代核心慣用寫法，從 timer_list 指標反推 priv 結構體指標。
+  取代舊式 container_of(t, struct ..., beacon_timer)。
+
+del_timer_sync(&priv->beacon_timer)
+  停止計時器，並等待正在執行的 callback 結束後才返回。
+  必須在清除 ap_vif 指標前呼叫，防止 use-after-free。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+三、測試方法
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【準備】載入模組
+
+  sudo make load
+  # 確認介面出現：
+  iw dev | grep Interface      # 應看到 wlan_min0
+
+────────────────────────────────────────────────────────────────
+測試 A：用 iw 手動啟動 AP 並觀察 Beacon 計時器
+────────────────────────────────────────────────────────────────
+
+  # 1. 建立 AP 介面
+  sudo iw dev wlan_min0 interface add ap0 type __ap
+  sudo ip link set ap0 up
+
+  # 2. 設定頻道（必須在 start_ap 前設定）
+  sudo iw dev ap0 set channel 1
+
+  # 3. 啟動 AP（此步驟觸發 bss_info_changed + beacon ENABLED）
+  sudo iw dev ap0 ibss join "TestAP" 2412 NOHT
+
+  # 4. 觀察 kernel log
+  dmesg | grep minimal_wlan
+  # 預期看到：
+  #   minimal_wlan: bss_info_changed — beacon ENABLED, starting timer
+
+  # 5. 停止 AP（觸發 beacon DISABLED）
+  sudo iw dev ap0 ibss leave
+  dmesg | grep minimal_wlan
+  # 預期看到：
+  #   minimal_wlan: bss_info_changed — beacon DISABLED, stopping timer
+
+────────────────────────────────────────────────────────────────
+測試 B：用 hostapd 啟動完整 AP 並抓取 Beacon 幀
+────────────────────────────────────────────────────────────────
+
+  # 需要安裝：sudo apt install hostapd tcpdump
+
+  # 1. 建立 hostapd 設定檔 /tmp/hostapd_test.conf：
+  cat > /tmp/hostapd_test.conf << 'EOF'
+  interface=wlan_min0
+  driver=nl80211
+  ssid=MinimalWLAN_Test
+  channel=1
+  hw_mode=g
+  EOF
+
+  # 2. 建立 monitor 介面（用於抓包）
+  sudo iw dev wlan_min0 interface add mon0 type monitor
+  sudo ip link set mon0 up
+
+  # 3. 啟動 hostapd（背景執行）
+  sudo hostapd /tmp/hostapd_test.conf &
+  sleep 2
+
+  # 4. 抓取 Beacon 幀（10 秒）
+  sudo tcpdump -i mon0 -c 20 type mgt subtype beacon \
+      -w /tmp/beacon_capture.pcap
+
+  # 5. 分析抓到的幀
+  tcpdump -r /tmp/beacon_capture.pcap -v
+  # 預期：看到 SSID="MinimalWLAN_Test"，間隔約 100 ms 的 Beacon
+
+  # 6. 停止 hostapd
+  sudo killall hostapd
+  sudo iw dev mon0 del
+
+────────────────────────────────────────────────────────────────
+測試 C：用 iw scan 驗證 BSS 出現在掃描結果
+────────────────────────────────────────────────────────────────
+
+  # 在另一個終端機（需要第二張實體無線網卡，或同一虛擬介面）
+  # 本虛擬驅動程式的注入是在 kernel 內部，不跨越實體空氣介面
+
+  # 觀察 cfg80211 看到的 BSS（需先啟動 AP）：
+  sudo iw dev wlan_min0 scan ap-force
+  # 若掃描結果出現 MinimalWLAN_Test 即表示注入成功
+
+────────────────────────────────────────────────────────────────
+測試 D：確認 kernel log 訊息
+────────────────────────────────────────────────────────────────
+
+  # 啟用 pr_debug 輸出（預設關閉，需設定 dyndbg）
+  sudo bash -c 'echo "module minimal_wlan +p" > /sys/kernel/debug/dynamic_debug/control'
+
+  # 之後每個 Beacon 注入都會印：
+  #   minimal_wlan: beacon_timer_fn — injecting Beacon (N bytes)
+
+  # 關閉 debug 輸出
+  sudo bash -c 'echo "module minimal_wlan -p" > /sys/kernel/debug/dynamic_debug/control'
+
+────────────────────────────────────────────────────────────────
+測試 E：驗證模組卸載時計時器正確停止
+────────────────────────────────────────────────────────────────
+
+  # 在 AP 仍在 Beacon 的狀態下直接 rmmod
+  sudo rmmod minimal_wlan
+  dmesg | grep minimal_wlan | tail -5
+  # 預期看到：
+  #   minimal_wlan: stop() — beacon timer cancelled
+  #   minimal_wlan: unloaded
+  # （不應出現 kernel panic 或 use-after-free 警告）
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+四、常見問題
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: ieee80211_beacon_get_tim() 持續回傳 NULL？
+A: AP BSS 尚未完整初始化。確認 hostapd 已成功啟動，
+   且 wlan_min0 介面已 up。kernel log 中應有 hostapd 相關訊息。
+
+Q: 編譯錯誤：ieee80211_beacon_get_tim 參數數量不符？
+A: link_id 參數在 kernel 5.19 加入。
+   若使用較舊核心，將呼叫改為：
+     ieee80211_beacon_get_tim(hw, vif, NULL, NULL)   /* 去掉最後的 0 */
+
+Q: tcpdump 在 mon0 上看不到任何幀？
+A: 確認 mon0 已 up（sudo ip link set mon0 up）。
+   注入的 Beacon 會出現在 mac80211 的 RX 路徑，
+   monitor 介面必須在 AP 啟動前建立才能收到。
+
+Q: 想調整 Beacon 間隔？
+A: 修改 minimal_wlan.c 頂部的：
+     #define BEACON_INTERVAL_MS  100
+   重新 make && sudo make reload 即生效。
+   實際 AP 通常使用 100 TU（約 102 ms），過短可能增加系統負擔。

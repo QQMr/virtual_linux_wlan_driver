@@ -1,0 +1,31 @@
+Test Each Callback
+==================
+
+1. start() / stop() — bring interface up/down
+   sudo ip link set wlan_min0 up
+   dmesg | grep minimal_wlan   # → "start() — hardware powered on"
+
+   sudo ip link set wlan_min0 down
+   dmesg | grep minimal_wlan   # → "stop() — hardware powered off"
+
+2. config() — channel change
+   sudo ip link set wlan_min0 up
+   sudo iw dev wlan_min0 set channel 6
+   dmesg | grep minimal_wlan   # → "config() — tuning to 2437 MHz"
+
+3. add_interface() — create a second virtual interface
+   sudo iw dev wlan_min0 interface add wlan_min1 type monitor
+   dmesg | grep minimal_wlan   # → "add_interface() type=6 addr=..."
+
+   sudo iw dev wlan_min1 del  # triggers remove_interface()
+
+4. tx() — trigger a transmit
+   sudo ip link set wlan_min0 up
+   sudo iw dev wlan_min0 scan
+   dmesg | grep minimal_wlan   # → "TX mgmt frame (N bytes)"
+
+5. Monitor mode (see raw frames)
+   sudo iw dev wlan_min0 interface add mon0 type monitor
+   sudo ip link set mon0 up
+   sudo tcpdump -i mon0 -w /tmp/capture.pcap &
+   sudo tcpdump -r /tmp/capture.pcap

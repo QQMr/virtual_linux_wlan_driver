@@ -51,6 +51,23 @@ MODULE_DESCRIPTION("Minimal virtual mac80211 WiFi driver (educational)");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("1.1");
 
+/*
+ * force_alloc_fail — module parameter for error-path testing.
+ *
+ * Usage:
+ *   sudo insmod minimal_wlan.ko force_alloc_fail=1
+ *
+ * When set to 1, ieee80211_alloc_hw() is skipped and the driver
+ * immediately returns -ENOMEM, reproducing the allocation-failure path
+ * without needing kernel fault injection infrastructure.
+ *
+ * Default: 0 (normal operation).
+ */
+static bool force_alloc_fail;
+module_param(force_alloc_fail, bool, 0444);
+MODULE_PARM_DESC(force_alloc_fail,
+		 "Force ieee80211_alloc_hw() to fail (for error-path testing)");
+
 /* -------------------------------------------------------------------------
  * 1. DRIVER PRIVATE DATA
  *
@@ -579,6 +596,11 @@ static int __init minimal_wlan_init(void)
 	 * sizeof(struct minimal_wlan_priv) bytes for our private data.
 	 * We get to our private data via hw->priv.
 	 * ---------------------------------------------------------------- */
+	if (force_alloc_fail) {
+		pr_err("minimal_wlan: ieee80211_alloc_hw() failed (forced by module param)\n");
+		return -ENOMEM;
+	}
+
 	g_hw = ieee80211_alloc_hw(sizeof(struct minimal_wlan_priv),
 				  &minimal_ops);
 	if (!g_hw) {

@@ -134,3 +134,68 @@ Hardware receives frame via antenna
    ```bash
    sudo modprobe mac80211_hwsim radios=2
    ```
+
+---
+
+## V4L2 Virtual Camera Driver
+
+This repo also includes `v4l2_virtual_cam.c`, a minimal virtual V4L2 camera
+driver that produces a colour-bar test pattern in YUYV format.
+
+### Files
+
+```
+├── v4l2_virtual_cam.c   ← the V4L2 driver (read this!)
+└── doc/V4L2_Study.md    ← V4L2 API study notes
+```
+
+### Build & Load
+
+```bash
+make                         # builds both minimal_wlan.ko and v4l2_virtual_cam.ko
+sudo make load-cam           # inserts the module → /dev/videoN appears
+sudo make show-cam           # v4l2-ctl --all output
+sudo make unload-cam         # remove the module
+```
+
+### Module Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `width`   | 640     | Frame width in pixels |
+| `height`  | 480     | Frame height in pixels |
+| `fps`     | 30      | Frames per second (timer-driven) |
+
+```bash
+sudo insmod v4l2_virtual_cam.ko width=1280 height=720 fps=60
+```
+
+### What Each Piece Does
+
+| Component | Role |
+|-----------|------|
+| `vcam_probe()` | Allocates state, registers `v4l2_device` + `video_device` |
+| `vcam_ioctl_ops` | Handles `QUERYCAP`, `ENUM_FMT`, `G/S_FMT` and delegates buffer ioctls to vb2 helpers |
+| `vcam_vb2_ops` | vb2 callbacks: queue setup, buffer prepare/queue, start/stop streaming |
+| `vcam_frame_timer()` | Kernel timer that fires at `fps` Hz, fills the next queued buffer with colour bars, marks it `DONE` |
+| `fill_yuyv_bars()` | Writes an 8-colour vertical bar pattern in YUYV packed format |
+
+### Capture a Frame from Userspace
+
+```bash
+# Capture 10 frames to stdout (requires ffmpeg)
+ffmpeg -f v4l2 -i /dev/video0 -vframes 10 frame%04d.png
+# Or with v4l2-ctl
+v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=5 --stream-to=out.yuv
+```
+
+### Key V4L2 Concepts Illustrated
+
+- `v4l2_device_register` / `video_register_device` lifecycle
+- `struct v4l2_ioctl_ops` dispatch table
+- `videobuf2` (vb2) queue with `vb2_vmalloc_memops`
+- `VIDIOC_REQBUFS` → `mmap()` → `VIDIOC_QBUF` → `VIDIOC_STREAMON` flow
+- Simulated hardware interrupt via `timer_list`
+- `v4l2_ctrl_handler` for a brightness control
+
+See `doc/V4L2_Study.md` for a full API walkthrough and comparison with mac80211.

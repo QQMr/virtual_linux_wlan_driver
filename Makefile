@@ -1,14 +1,21 @@
-# Makefile for minimal_wlan driver
+# Makefile for virtual Linux driver study modules
+#
+# Modules:
+#   minimal_wlan    — mac80211-based virtual WiFi driver
+#   v4l2_virtual_cam — V4L2 virtual camera driver (colour-bar test pattern)
 #
 # Usage:
-#   make              — build the kernel module
+#   make              — build all modules
 #   make clean        — remove build artifacts
-#   sudo make load    — insert the module
-#   sudo make unload  — remove the module
+#   sudo make load    — insert minimal_wlan module
+#   sudo make unload  — remove minimal_wlan module
 #   sudo make reload  — unload + load (quick development cycle)
+#   sudo make load-cam   — insert v4l2_virtual_cam module
+#   sudo make unload-cam — remove v4l2_virtual_cam module
 
-# Name of the kernel module
+# Kernel modules to build
 obj-m += minimal_wlan.o
+obj-m += v4l2_virtual_cam.o
 
 # Path to the running kernel's build directory
 KDIR := /lib/modules/$(shell uname -r)/build
@@ -47,4 +54,26 @@ show:
 	@echo "=== iw dev ==="
 	iw dev 2>/dev/null || echo "(iw not installed — try: apt install iw)"
 
-.PHONY: all clean load unload reload show
+# --- V4L2 virtual camera targets ---
+
+# Insert v4l2_virtual_cam and confirm the /dev/videoN node
+load-cam:
+	insmod v4l2_virtual_cam.ko
+	@echo "--- kernel log ---"
+	dmesg | tail -10
+	@echo ""
+	@echo "=== video devices ==="
+	v4l2-ctl --list-devices 2>/dev/null || echo "(v4l2-ctl not installed — try: apt install v4l-utils)"
+
+# Remove v4l2_virtual_cam
+unload-cam:
+	rmmod v4l2_virtual_cam || true
+	@echo "--- kernel log ---"
+	dmesg | tail -5
+
+# Show info about the virtual camera (run after load-cam)
+show-cam:
+	@echo "=== V4L2 device info ==="
+	v4l2-ctl --all 2>/dev/null || echo "(v4l2-ctl not installed)"
+
+.PHONY: all clean load unload reload show load-cam unload-cam show-cam

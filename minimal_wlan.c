@@ -590,32 +590,7 @@ static int __init minimal_wlan_init(void)
 	pr_info("minimal_wlan: loading module\n");
 
 	/* ------------------------------------------------------------------
-	 * Step A: Pre-flight check — warn if brcmfmac is loaded.
-	 *
-	 * On Raspberry Pi 5, brcmfmac (the onboard WiFi driver) loads first
-	 * and allocates firmware DMA buffers plus a wiphy device, consuming
-	 * a significant portion of the kernel's normal-zone memory.
-	 *
-	 * ieee80211_alloc_hw() → wiphy_new_nm() → kzalloc() can then fail
-	 * not because of a bug in our driver, but because brcmfmac has
-	 * already consumed the available contiguous memory.
-	 *
-	 * try_module_get(brcmfmac_module) is not available here because we
-	 * do not have a direct symbol reference.  Instead we use
-	 * find_module() to detect its presence and emit an advisory warning
-	 * before attempting the allocation.
-	 *
-	 * Resolution: sudo rmmod brcmfmac brcmutil, then reload us.
-	 * See: sudo make blacklist-brcmfmac (in Makefile) for convenience.
-	 * ---------------------------------------------------------------- */
-	mutex_lock(&module_mutex);
-	if (find_module("brcmfmac"))
-		pr_warn("minimal_wlan: brcmfmac is loaded — if ieee80211_alloc_hw() fails,\n"
-			"              run: sudo rmmod brcmfmac brcmutil\n");
-	mutex_unlock(&module_mutex);
-
-	/* ------------------------------------------------------------------
-	 * Step B: Allocate ieee80211_hw
+	 * Step A: Allocate ieee80211_hw
 	 *
 	 * ieee80211_alloc_hw() creates the hw struct AND appends
 	 * sizeof(struct minimal_wlan_priv) bytes for our private data.
